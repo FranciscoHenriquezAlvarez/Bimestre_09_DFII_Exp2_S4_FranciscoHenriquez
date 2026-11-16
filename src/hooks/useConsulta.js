@@ -1,8 +1,83 @@
 import { useEffect, useState } from 'react'
 import { obtenerJson } from '../services/api.js'
 
-// Caché de sesión en memoria para evitar solicitudes innecesarias.
+// Caché de sesión para reutilizar respuestas exitosas.
 const cache = new Map()
+
+// Registro de solicitudes que todavía están en curso.
+const solicitudesPendientes = new Map()
+
+function obtenerSolicitud(url) {
+  // Reutilizar una solicitud existente para la misma URL.
+  const existente = solicitudesPendientes.get(url)
+
+  if (existente) {
+    if (existente.temporizador !== null) {
+      clearTimeout(existente.temporizador)
+      existente.temporizador = null
+    }
+
+    existente.consumidores += 1
+    return existente
+  }
+
+  const controller = new AbortController()
+
+  const solicitud = {
+    controller,
+    consumidores: 1,
+    temporizador: null,
+    promesa: null
+  }
+
+  solicitud.promesa = obtenerJson(url, {
+    signal: controller.signal
+  })
+    .then((datos) => {
+      if (!controller.signal.aborted) {
+        cache.set(url, datos)
+      }
+
+      return datos
+    })
+    .finally(() => {
+      if (solicitudesPendientes.get(url) === solicitud) {
+        solicitudesPendientes.delete(url)
+      }
+    })
+
+  solicitudesPendientes.set(url, solicitud)
+
+  return solicitud
+}
+
+function liberarSolicitud(url, solicitud) {
+  solicitud.consumidores = Math.max(
+    0,
+    solicitud.consumidores - 1
+  )
+
+  // No cancelar si todavía existen componentes interesados.
+  if (solicitud.consumidores > 0) {
+    return
+  }
+
+  // Permitir reutilizar la solicitud durante una
+  // limpieza y nueva ejecución inmediata del efecto.
+  solicitud.temporizador = setTimeout(() => {
+    solicitud.temporizador = null
+
+    if (solicitud.consumidores > 0) {
+      return
+    }
+
+    solicitud.controller.abort()
+
+    if (solicitudesPendientes.get(url) === solicitud) {
+      solicitudesPendientes.delete(url)
+    }
+  }, 0)
+}
 
 export function useConsulta(url) {
   const [revision, setRevision] = useState(0)
@@ -15,18 +90,20 @@ export function useConsulta(url) {
   }))
 
   useEffect(() => {
-    const controller = new AbortController()
+    let activo = true
 
-    // Utilizar los datos almacenados si están disponibles.
+    // Si existen datos en caché, no realizar otra petición.
     if (cache.has(url)) {
       return undefined
     }
 
-    obtenerJson(url, { signal: controller.signal })
-      .then((datos) => {
-        if (controller.signal.aborted) return
+    const solicitud = obtenerSolicitud(url)
 
-        cache.set(url, datos)
+    solicitud.promesa
+      .then((datos) => {
+        if (!activo || solicitud.controller.signal.aborted) {
+          return
+        }
 
         setEstado({
           url,
@@ -36,8 +113,10 @@ export function useConsulta(url) {
         })
       })
       .catch((error) => {
-        // Ignorar las cancelaciones esperadas.
-        if (controller.signal.aborted) return
+        // Ignorar cancelaciones esperadas.
+        if (!activo || solicitud.controller.signal.aborted) {
+          return
+        }
 
         setEstado({
           url,
@@ -48,11 +127,12 @@ export function useConsulta(url) {
       })
 
     return () => {
-      controller.abort()
+      activo = false
+      liberarSolicitud(url, solicitud)
     }
   }, [url, revision])
 
-  // Evitar mostrar datos correspondientes a otra categoría.
+  // Evitar mostrar datos pertenecientes a otra URL.
   const actual = cache.has(url)
     ? {
         datos: cache.get(url),
@@ -72,6 +152,8 @@ export function useConsulta(url) {
         }
 
   const reintentar = () => {
+    // Invalidar los datos anteriores para solicitar
+    // una respuesta actualizada.
     cache.delete(url)
 
     setEstado({
